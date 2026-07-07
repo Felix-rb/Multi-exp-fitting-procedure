@@ -18,6 +18,27 @@ Benoetigte Pakete: numpy, scipy, pandas, matplotlib, tkinter (Standardbibliothek
 
 Start:
     python tcspc_reconvolution_fit.py
+
+Changelog
+---------
+v2 (2026-07-07):
+  - Amplituden-Skalierung korrigiert: Die Faltung hat das Ergebnis bisher
+    zusaetzlich mit dt multipliziert, obwohl die IRF bereits auf Summe = 1
+    normiert war. Dadurch trugen alle gefitteten Amplituden A_i einen
+    versteckten Faktor 1/dt (bei 2 ps Zeitschritt: Faktor 500) und lagen
+    in unueblich hohen Zahlenbereichen (mehrere hundert statt ~1-10).
+    Die Multiplikation mit dt wurde entfernt; Zeitkonstanten, Chi-Quadrat
+    und die Form der Fit-Kurve sind davon unveraendert, nur A_i liegt jetzt
+    auf der gleichen Groessenordnung wie die Rohdaten.
+  - Zusaetzliche Kennzahl tau_mean_intensity_ns ergaenzt (intensitaets-
+    gewichtete mittlere Lebensdauer, tau_mean_intensity = Summe(A_i*tau_i^2)
+    / Summe(A_i*tau_i)). Die bisherige amplitudengewichtete tau_mean reagiert
+    sehr empfindlich auf numerisch "entartete" Komponenten mit extrem
+    kurzem tau und entsprechend riesiger Amplitude (die kaum echte
+    Intensitaet beitragen, aber die Mittelung dominieren). tau_mean_intensity
+    ist gegenueber solchen Artefakten deutlich robuster und wird zusaetzlich
+    zur bisherigen tau_mean ausgegeben.
+v1 (2026-07-06): Erste Version (Einzel-/globaler Reconvolution-Fit, GUI).
 """
 
 from __future__ import annotations
@@ -91,6 +112,7 @@ class SingleFitResult:
     irf_shift_ns: float
     tau_mean_ns: float
     tau_mean_abs_ns: Optional[float]
+    tau_mean_intensity_ns: float
     chi2: float
     red_chi2: float
     dof: int
@@ -117,6 +139,7 @@ class GlobalFitResult:
     red_chi2_per_ds: List[float]
     tau_mean_per_ds: List[float]
     tau_mean_abs_per_ds: List[Optional[float]]
+    tau_mean_intensity_per_ds: List[float]
     total_chi2: float
     total_red_chi2: float
     t_list: List[np.ndarray]
@@ -268,15 +291,17 @@ def multiexp_model(t: np.ndarray, amps: np.ndarray, taus_ns: np.ndarray) -> np.n
     return np.sum(amps[:, None] * np.exp(-t[None, :] / taus_safe[:, None]), axis=0)
 
 
-def convolve_with_irf(model_y: np.ndarray, irf_y: np.ndarray, dt: float) -> np.ndarray:
+def convolve_with_irf(model_y: np.ndarray, irf_y: np.ndarray) -> np.ndarray:
     """
     Faltet das Modell kausal mit der IRF (beide auf demselben Zeitgitter).
     fftconvolve(..., mode='full')[:N] entspricht der diskreten kausalen
-    Faltungssumme; Multiplikation mit dt approximiert das Faltungsintegral.
+    Faltungssumme. Die IRF ist auf Summe = 1 normiert, wirkt also wie ein
+    gewichteter gleitender Durchschnitt: die gefaltete Kurve bleibt dadurch
+    auf derselben Amplituden-Groessenordnung wie das unkonvolvierte Modell
+    (keine zusaetzliche Multiplikation mit dt - siehe Changelog v2).
     """
     n = len(model_y)
-    conv = fftconvolve(model_y, irf_y, mode="full")[:n]
-    return conv * dt
+    return fftconvolve(model_y, irf_y, mode="full")[:n]
 
 
 def forward_model(
@@ -287,12 +312,11 @@ def forward_model(
     shift_ns: float,
     irf_t: np.ndarray,
     irf_y_area_norm: np.ndarray,
-    dt: float,
 ) -> np.ndarray:
     """Komplettes Vorwaertsmodell: verschobene IRF (*) multiexp. Zerfall + Offset."""
     shifted_irf = shift_signal(irf_t, irf_y_area_norm, shift_ns)
     decay = multiexp_model(t, amps, taus_ns)
-    conv = convolve_with_irf(decay, shifted_irf, dt)
+    conv = convolve_with_irf(decay, shifted_irf)
     return conv + offset
 
 
@@ -401,7 +425,7 @@ def _unpack_single(params: np.ndarray, n_comp: int, fit_shift: bool, fixed_shift
 
 def _single_residuals(params, ctx: FitContext, n_comp: int, fit_shift: bool, fixed_shift: float):
     amps, taus, offset, shift = _unpack_single(params, n_comp, fit_shift, fixed_shift)
-    model_hat = forward_model(ctx.t, amps, taus, offset, shift, ctx.irf_t, ctx.irf_y_norm, ctx.dt)
+    model_hat = forward_model(ctx.t, amps, taus, offset, shift, ctx.irf_t, ctx.irf_y_norm)
     return (ctx.y_hat - model_hat) * ctx.weight_hat
 
 
@@ -494,6 +518,7 @@ def fit_single_dataset(
             irf_shift_ns=np.nan,
             tau_mean_ns=np.nan,
             tau_mean_abs_ns=None,
+            tau_mean_intensity_ns=np.nan,
             chi2=np.nan,
             red_chi2=np.nan,
             dof=0,
@@ -515,7 +540,7 @@ def fit_single_dataset(
     amps = amps_hat * ctx.scale
     offset = offset_hat * ctx.scale
 
-    fit_curve = forward_model(t, amps, taus, offset, shift, ctx.irf_t, ctx.irf_y_norm, ctx.dt)
+    fit_curve = forward_model(t, amps, taus, offset, shift, ctx.irf_t, ctx.irf_y_norm)
     residuals = y_raw - fit_curve
 
     n_free = 2 * n_components + 1 + (1 if fit_irf_shift else 0)
@@ -530,6 +555,13 @@ def fit_single_dataset(
     if has_negative:
         sum_abs = np.sum(np.abs(amps))
         tau_mean_abs = float(np.sum(np.abs(amps) * taus) / sum_abs) if sum_abs != 0 else float("nan")
+
+    # Intensitaets-/zweitmomentgewichtete mittlere Lebensdauer: robuster als tau_mean
+    # gegenueber numerisch entarteten Komponenten mit sehr kleinem tau und
+    # entsprechend riesiger Amplitude (die kaum zu A_i*tau_i beitragen, aber
+    # die amplitudengewichtete Mittelung dominieren wuerden).
+    sum_a_tau = np.sum(amps * taus)
+    tau_mean_intensity = float(np.sum(amps * taus ** 2) / sum_a_tau) if sum_a_tau != 0 else float("nan")
 
     # Verschobene IRF fuer Anzeige/CSV: auf Peak der Rohdaten skaliert (nur zur Visualisierung).
     shifted_irf_norm = shift_signal(ctx.irf_t, ctx.irf_y_norm, shift)
@@ -550,6 +582,7 @@ def fit_single_dataset(
         irf_shift_ns=shift,
         tau_mean_ns=tau_mean,
         tau_mean_abs_ns=tau_mean_abs,
+        tau_mean_intensity_ns=tau_mean_intensity,
         chi2=chi2,
         red_chi2=red_chi2,
         dof=dof,
@@ -588,7 +621,7 @@ def _global_residuals(params, contexts: List[FitContext], n_comp: int, K: int, f
     all_res = []
     for k in range(K):
         ctx = contexts[k]
-        model_hat = forward_model(ctx.t, amps_list[k], taus, offsets[k], shifts[k], ctx.irf_t, ctx.irf_y_norm, ctx.dt)
+        model_hat = forward_model(ctx.t, amps_list[k], taus, offsets[k], shifts[k], ctx.irf_t, ctx.irf_y_norm)
         all_res.append((ctx.y_hat - model_hat) * ctx.weight_hat)
     return np.concatenate(all_res)
 
@@ -701,18 +734,19 @@ def fit_global_datasets(
     red_chi2_per_ds = []
     tau_mean_per_ds = []
     tau_mean_abs_per_ds: List[Optional[float]] = []
+    tau_mean_intensity_per_ds = []
     irf_display_list = []
 
     n_local_free = n_components + 1 + (1 if fit_irf_shift else 0)
 
     for k in range(K):
         ctx = contexts[k]
-        fit_curve = forward_model(ctx.t, amps_list[k], taus, offsets[k], shifts[k], ctx.irf_t, ctx.irf_y_norm, ctx.dt)
+        fit_curve = forward_model(ctx.t, amps_list[k], taus, offsets[k], shifts[k], ctx.irf_t, ctx.irf_y_norm)
         residual = ctx.y_raw - fit_curve
         fit_curves.append(fit_curve)
         residuals_list.append(residual)
 
-        model_hat_k = forward_model(ctx.t, amps_list_hat[k], taus, offsets_hat[k], shifts[k], ctx.irf_t, ctx.irf_y_norm, ctx.dt)
+        model_hat_k = forward_model(ctx.t, amps_list_hat[k], taus, offsets_hat[k], shifts[k], ctx.irf_t, ctx.irf_y_norm)
         res_hat_k = (ctx.y_hat - model_hat_k) * ctx.weight_hat
         chi2_k = float(np.sum(res_hat_k ** 2))
         dof_k = max(len(ctx.t) - n_local_free, 1)
@@ -727,6 +761,10 @@ def fit_global_datasets(
             tau_mean_abs_per_ds.append(float(np.sum(np.abs(amps_list[k]) * taus) / sum_abs) if sum_abs != 0 else float("nan"))
         else:
             tau_mean_abs_per_ds.append(None)
+
+        sum_a_tau = np.sum(amps_list[k] * taus)
+        tau_mean_intensity_k = float(np.sum(amps_list[k] * taus ** 2) / sum_a_tau) if sum_a_tau != 0 else float("nan")
+        tau_mean_intensity_per_ds.append(tau_mean_intensity_k)
 
         shifted_irf_norm = shift_signal(ctx.irf_t, ctx.irf_y_norm, shifts[k])
         irf_display_y = shifted_irf_norm
@@ -760,6 +798,7 @@ def fit_global_datasets(
         red_chi2_per_ds=red_chi2_per_ds,
         tau_mean_per_ds=tau_mean_per_ds,
         tau_mean_abs_per_ds=tau_mean_abs_per_ds,
+        tau_mean_intensity_per_ds=tau_mean_intensity_per_ds,
         total_chi2=total_chi2,
         total_red_chi2=total_red_chi2,
         t_list=[ctx.t for ctx in contexts],
@@ -830,9 +869,10 @@ def save_single_fit_outputs(output_dir: str, result: SingleFitResult, label: str
     lines.append("")
     lines.append(f"Offset: {result.offset:.6g}")
     lines.append(f"IRF-Shift (ns): {result.irf_shift_ns:.6g}")
-    lines.append(f"Mittlere Lebensdauer tau_mean (ns): {result.tau_mean_ns:.6g}")
+    lines.append(f"Mittlere Lebensdauer, amplitudengewichtet, tau_mean (ns): {result.tau_mean_ns:.6g}")
     if result.tau_mean_abs_ns is not None:
         lines.append(f"Mittlere Lebensdauer (Betragsamplituden) tau_mean_abs (ns): {result.tau_mean_abs_ns:.6g}")
+    lines.append(f"Mittlere Lebensdauer, intensitaetsgewichtet, tau_mean_intensity (ns): {result.tau_mean_intensity_ns:.6g}")
     lines.append(f"Chi-Quadrat: {result.chi2:.6g}")
     lines.append(f"Reduziertes Chi-Quadrat: {result.red_chi2:.6g} (dof={result.dof})")
 
@@ -915,9 +955,10 @@ def save_global_fit_outputs(output_dir: str, result: GlobalFitResult) -> str:
             lines.append(f"  A_{i + 1} = {result.amplitudes_per_ds[k][i]:.6g}")
         lines.append(f"  Offset = {result.offsets[k]:.6g}")
         lines.append(f"  IRF-Shift (ns) = {result.irf_shifts_ns[k]:.6g}")
-        lines.append(f"  tau_mean (ns) = {result.tau_mean_per_ds[k]:.6g}")
+        lines.append(f"  tau_mean, amplitudengewichtet (ns) = {result.tau_mean_per_ds[k]:.6g}")
         if result.tau_mean_abs_per_ds[k] is not None:
             lines.append(f"  tau_mean_abs (ns) = {result.tau_mean_abs_per_ds[k]:.6g}")
+        lines.append(f"  tau_mean_intensity, intensitaetsgewichtet (ns) = {result.tau_mean_intensity_per_ds[k]:.6g}")
         lines.append(f"  Chi-Quadrat = {result.chi2_per_ds[k]:.6g}")
         lines.append(f"  Reduziertes Chi-Quadrat = {result.red_chi2_per_ds[k]:.6g}")
         lines.append("")
