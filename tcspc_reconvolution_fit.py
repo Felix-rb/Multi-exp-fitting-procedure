@@ -21,6 +21,14 @@ Start:
 
 Changelog
 ---------
+v3 (2026-07-08):
+  - Ausgabedateien (fit_parameters.txt / global_fit_parameters.txt) zeigen
+    pro Komponente jetzt zusaetzlich A_i*tau_i und den prozentualen Anteil
+    daran. A_i allein ist bei sehr unterschiedlichen tau_i irrefuehrend
+    (kurze Komponenten brauchen numerisch grosse A_i fuer einen kleinen
+    Kurvenbeitrag), waehrend A_i*tau_i die tatsaechliche Gewichtung zeigt,
+    aus der sich tau_mean_intensity direkt ablesen laesst:
+    tau_mean_intensity = Summe(A_i*tau_i * tau_i) / Summe(A_i*tau_i).
 v2 (2026-07-07):
   - Amplituden-Skalierung korrigiert: Die Faltung hat das Ergebnis bisher
     zusaetzlich mit dt multipliziert, obwohl die IRF bereits auf Summe = 1
@@ -90,10 +98,10 @@ RANDOM_SEED = 42
 # vorgegeben; ein viertes wurde ergaenzt (breiterer Bereich), da vier Buttons
 # gewuenscht waren, aber nur drei Beispiel-Listen mitgeliefert wurden.
 PRESETS: Dict[int, List[float]] = {
-    1: [0.05, 0.2, 0.8, 2.5],
-    2: [0.03, 0.15, 0.6, 1.8],
-    3: [0.1, 0.4, 1.2, 3.5],
-    4: [0.02, 0.1, 0.5, 2.0],
+    1: [0.02, 0.08, 0.3, 0.6],
+    2: [0.02, 0.08, 0.7, 2],
+    3: [0.02, 0.08, 1.2, 3.5],
+    4: [0.02, 0.08, 0.4, 0.9],
 }
 
 
@@ -863,9 +871,12 @@ def save_single_fit_outputs(output_dir: str, result: SingleFitResult, label: str
     lines.append(f"Status: {'OK' if result.success else 'FEHLER/Warnung'} - {result.message}")
     lines.append(f"Anzahl Komponenten: {result.n_components}")
     lines.append("")
-    lines.append("Komponente\tA_i\ttau_i (ns)")
+    a_tau = result.amplitudes * result.taus_ns
+    sum_a_tau = np.sum(a_tau)
+    lines.append("Komponente\tA_i\ttau_i (ns)\tA_i*tau_i\tAnteil A_i*tau_i (%)")
     for i in range(result.n_components):
-        lines.append(f"{i + 1}\t{result.amplitudes[i]:.6g}\t{result.taus_ns[i]:.6g}")
+        share = 100.0 * a_tau[i] / sum_a_tau if sum_a_tau != 0 else float("nan")
+        lines.append(f"{i + 1}\t{result.amplitudes[i]:.6g}\t{result.taus_ns[i]:.6g}\t{a_tau[i]:.6g}\t{share:.2f}")
     lines.append("")
     lines.append(f"Offset: {result.offset:.6g}")
     lines.append(f"IRF-Shift (ns): {result.irf_shift_ns:.6g}")
@@ -873,6 +884,7 @@ def save_single_fit_outputs(output_dir: str, result: SingleFitResult, label: str
     if result.tau_mean_abs_ns is not None:
         lines.append(f"Mittlere Lebensdauer (Betragsamplituden) tau_mean_abs (ns): {result.tau_mean_abs_ns:.6g}")
     lines.append(f"Mittlere Lebensdauer, intensitaetsgewichtet, tau_mean_intensity (ns): {result.tau_mean_intensity_ns:.6g}")
+    lines.append(f"  (= Summe(A_i*tau_i * tau_i) / Summe(A_i*tau_i), Spalte 'A_i*tau_i' oben)")
     lines.append(f"Chi-Quadrat: {result.chi2:.6g}")
     lines.append(f"Reduziertes Chi-Quadrat: {result.red_chi2:.6g} (dof={result.dof})")
 
@@ -950,9 +962,12 @@ def save_global_fit_outputs(output_dir: str, result: GlobalFitResult) -> str:
         lines.append(f"  tau_{i + 1} = {tau:.6g} ns")
     lines.append("")
     for k, label in enumerate(result.labels):
+        a_tau_k = result.amplitudes_per_ds[k] * result.taus_ns
+        sum_a_tau_k = np.sum(a_tau_k)
         lines.append(f"--- {label} (wavelength = {result.wavelengths[k]} nm) ---")
         for i in range(result.n_components):
-            lines.append(f"  A_{i + 1} = {result.amplitudes_per_ds[k][i]:.6g}")
+            share = 100.0 * a_tau_k[i] / sum_a_tau_k if sum_a_tau_k != 0 else float("nan")
+            lines.append(f"  A_{i + 1} = {result.amplitudes_per_ds[k][i]:.6g}   A_{i + 1}*tau_{i + 1} = {a_tau_k[i]:.6g}   Anteil = {share:.2f}%")
         lines.append(f"  Offset = {result.offsets[k]:.6g}")
         lines.append(f"  IRF-Shift (ns) = {result.irf_shifts_ns[k]:.6g}")
         lines.append(f"  tau_mean, amplitudengewichtet (ns) = {result.tau_mean_per_ds[k]:.6g}")
